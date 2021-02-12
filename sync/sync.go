@@ -23,14 +23,14 @@ const (
 )
 
 type DataDiff struct {
-	Offset		int64
+	Offset		int
 	Data		[]byte
 	Size		int
 }
 
 type MatchDiff struct {
-	SourceOffset		int64
-	DestinationOffset	int64
+	SourceOffset		int
+	DestinationOffset	int
 }
 
 type Diff struct {
@@ -75,13 +75,13 @@ func constructHashesMap(hashes[]DataBlockHash) map[uint64][]int {
 	return hashesMap
 }
 
-func (t *SourceTransmitter) calculateMD5Hash(offset int64) []byte {
-	end := offset + int64(t.N)
+func (t *SourceTransmitter) calculateMD5Hash(offset int) []byte {
+	end := offset + t.N
 	return md5.New().Sum([]byte(t.Data[offset:end]))
 }
 
 func (t *SourceTransmitter) checkAndAppendDiff(
-	offset int64,
+	offset int,
 	hash PolynomialHash,
 	hashes []DataBlockHash,
 	hashesMap map[uint64][]int,
@@ -99,7 +99,7 @@ func (t *SourceTransmitter) checkAndAppendDiff(
 		if bytes.Compare(md5Hash, destHash.md5Hash) == 0 {
 			diffs = append(diffs, Diff{
 				Type: MatchDiffType,
-				DataDiff: DataDiff{int64(0), nil, 0},
+				DataDiff: DataDiff{0, nil, 0},
 				MatchDiff: MatchDiff{
 					SourceOffset:      offset,
 					DestinationOffset: destHash.offset,
@@ -146,13 +146,13 @@ func (t *SourceTransmitter) MatchBlockHashesAndStreamDiff(hashes []DataBlockHash
 		prevCh := int32(t.Data[index - t.N])
 		hash = hash.PopLeft(prevCh, t.hashOptions)
 		hash = hash.Append(int32(t.Data[index]), t.hashOptions)
-		if found := t.checkAndAppendDiff(int64(index - t.N + 1), hash, hashes, hashesMap, diff); found {
+		if found := t.checkAndAppendDiff(index - t.N + 1, hash, hashes, hashesMap, diff); found {
 			if lastMatched < index - 1 {
 				diff = append(diff, Diff{
 					Type: DataDiffType,
 					MatchDiff: MatchDiff{},
 					DataDiff: DataDiff{
-						Offset: int64(firstUnmatched),
+						Offset: firstUnmatched,
 						Data:   []byte(t.Data[firstUnmatched:index]),
 						Size:   index - firstUnmatched,
 					},
@@ -173,7 +173,7 @@ func (t *SourceTransmitter) MatchBlockHashesAndStreamDiff(hashes []DataBlockHash
 			Type: DataDiffType,
 			MatchDiff: MatchDiff{},
 			DataDiff: DataDiff{
-				Offset: int64(firstUnmatched),
+				Offset: firstUnmatched,
 				Data:   []byte(t.Data[firstUnmatched:]),
 				Size:   len(t.Data) - firstUnmatched,
 			},
@@ -186,7 +186,7 @@ func (t *SourceTransmitter) MatchBlockHashesAndStreamDiff(hashes []DataBlockHash
 type DestinationTransmitterOptions struct {
 	hashOptions		PolynomialHashOptions
 
-	N		int64
+	N		int
 }
 
 type DestinationTransmitter struct {
@@ -200,20 +200,20 @@ func CreateDestinationTransmitter(data string, options DestinationTransmitterOpt
 }
 
 type DataBlockHash struct {
-	offset		int64
+	offset		int
 	hash1		PolynomialHash
 	md5Hash		[]byte
 }
 
 func (t *DestinationTransmitter) BuildBlockHashes() []DataBlockHash {
 	dataBlockHashes := make([]DataBlockHash, 0)
-	currentSize := int64(0)
-	start := int64(0)
+	currentSize := 0
+	start := 0
 
 	hash1 := PolynomialHash{0}
 	for i, ch := range t.data {
 		hash1 = hash1.Append(ch, t.options.hashOptions)
-		leftIndex := int64(i) - t.options.N
+		leftIndex := i - t.options.N
 		if leftIndex >= 0 {
 			hash1 = hash1.PopLeft(int32(t.data[leftIndex]), t.options.hashOptions)
 		}
@@ -231,6 +231,34 @@ func (t *DestinationTransmitter) BuildBlockHashes() []DataBlockHash {
 	return dataBlockHashes
 }
 
+func SpliceData(data *[]byte, start, end int, source []byte) {
+	for i := 0; start != end; start++ {
+		if start < len(*data) {
+			(*data)[start] = source[i]
+		} else {
+			*data = append(*data, source[i])
+		}
+
+		i++
+	}
+}
+
 func (t *DestinationTransmitter) ConstructOriginalData(diffs []Diff) string {
-	return ""
+	data := make([]byte, 0)
+	N := t.options.N
+	for _, diff := range diffs {
+		switch diff.Type {
+		case DataDiffType:
+			dataDiff := &diff.DataDiff
+			SpliceData(&data, dataDiff.Offset, dataDiff.Offset + dataDiff.Size, dataDiff.Data)
+			break
+		case MatchDiffType:
+			matchDiff := &diff.MatchDiff
+			start := matchDiff.DestinationOffset
+			SpliceData(&data, matchDiff.SourceOffset, matchDiff.SourceOffset + N, []byte(t.data[start: start + N]))
+			break
+		}
+	}
+
+	return string(data)
 }
