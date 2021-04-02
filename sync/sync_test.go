@@ -42,7 +42,7 @@ func TestSimple(t *testing.T) {
 			N:           windowLength,
 		})
 
-		destinationHashBlocks := destinationTransmitter.BuildBlockHashes()
+		destinationHashBlocks := destinationTransmitter.GenerateBlockHashes()
 
 		stream := sourceTransmitter.MatchBlockHashesAndStreamDiff(destinationHashBlocks)
 		data := destinationTransmitter.ConstructOriginalData(stream)
