@@ -2,11 +2,6 @@ package sync
 
 type DiffType int
 
-const (
-	DataDiffType 	DiffType = iota
-	MatchDiffType
-)
-
 type DataDiff struct {
 	Offset		int
 	Size		int

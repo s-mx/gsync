@@ -48,14 +48,13 @@ const (
 
 // PerformTransmission() function performs a whole transmission process via protocol.
 // TODO: describe the protocol
-func (t *DestinationTransmitter) PerformTransmission(ctx context.Context) error {
+func (t *DestinationTransmitter) PerformTransmission(ctx context.Context) (string, error) {
 	channelSize := 4096 * 256 // TODO: setup this setting.
 	blockHashesChannel := make(chan DataBlockHash, channelSize)
 	quitChannel := make(chan error, 1)
 	newCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go t.GenerateBlockHashes(newCtx, blockHashesChannel, quitChannel)
-
 
 	var err error = nil
 	currentBufferSize := 0
@@ -97,7 +96,12 @@ loop:
 		err = t.SendEndingMessage()
 	}
 
-	return err
+	var data string
+	if data, err = t.ConstructFile(ctx); err != nil {
+		return "", err
+	}
+
+	return data, err
 }
 
 type DataBlockHash struct {
@@ -340,7 +344,7 @@ func (t *DestinationTransmitter) ReadIncomingStream(
 	return nil
 }
 
-func (t* DestinationTransmitter) ConstructFile(ctx context.Context) error {
+func (t* DestinationTransmitter) ConstructFile(ctx context.Context) (string, error) {
 	quit := make(chan error, 1)
 
 	// TODO: it is better to justify to size of gotten data.
@@ -349,10 +353,10 @@ func (t* DestinationTransmitter) ConstructFile(ctx context.Context) error {
 	go t.WriteData(ctx, diffsChannel, quit)
 
 	if err := t.ReadIncomingStream(ctx, diffsChannel); err != nil {
-		return err
+		return "", err
 	}
 
 	close(diffsChannel)
 	<- quit
-	return nil
+	return string(t.newData), nil
 }
