@@ -1,26 +1,26 @@
 package sync
 
 type PolynomialHash struct {
-	value	uint64
+	Value uint64
 }
 
 func (h PolynomialHash) Append(ch int32, options PolynomialHashOptions) PolynomialHash {
 	hash := h
-	hash.value *= uint64(options.parameter)
-	if hash.value >= uint64(options.modulo) {
-		hash.value %= uint64(options.modulo)
+	hash.Value *= uint64(options.parameter)
+	if hash.Value >= uint64(options.modulo) {
+		hash.Value %= uint64(options.modulo)
 	}
 
-	hash.value += uint64(ch)
-	if hash.value >= uint64(options.modulo) {
-		hash.value %= uint64(options.modulo)
+	hash.Value += uint64(ch)
+	if hash.Value >= uint64(options.modulo) {
+		hash.Value %= uint64(options.modulo)
 	}
 
 	return hash
 }
 
 func (h PolynomialHash) PopLeft(ch int32, options PolynomialHashOptions) PolynomialHash {
-	value := h.value
+	value := h.Value
 	value -= (uint64(ch) * options.leftTerm) % options.modulo
 	if value >= options.modulo {
 		// value must be in the ring [0, modulo), so we return it in the ring in this branch.

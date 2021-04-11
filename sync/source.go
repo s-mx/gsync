@@ -8,32 +8,34 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
-	"io"
 	"log"
+	"net"
+	"time"
 )
 
 type SourceTransmitterOptions struct {
 	hashOptions		PolynomialHashOptions
 
-	N	int
+	N       		int
+	Timeout 		time.Duration
 }
 
 type SourceTransmitter struct {
-	hashOptions		PolynomialHashOptions
+	SourceTransmitterOptions
 
-	Data	string
-	N		int
+	filename		string
+	Data			string
 
-	dataChannel		io.ReadWriteCloser
+	dataChannel		net.Conn
 
 	matchesBuffer	[]MatchDiff
 }
 
-func CreateSourceTransmitter(data string, options SourceTransmitterOptions, channel io.ReadWriteCloser) *SourceTransmitter {
+func CreateSourceTransmitter(filename, data string, options SourceTransmitterOptions, channel net.Conn) *SourceTransmitter {
 	return &SourceTransmitter{
-		hashOptions: options.hashOptions,
+		SourceTransmitterOptions: options,
+		filename: filename,
 		Data: data,
-		N: options.N,
 		dataChannel: channel,
 	}
 }
@@ -42,7 +44,7 @@ func constructHashesMap(hashes[]DataBlockHash) map[uint64][]int {
 	hashesMap := make(map[uint64][]int)
 	for i := range hashes {
 		hash := &hashes[i]
-		value := hash.hash1.value
+		value := hash.Hash1.Value
 		if _, ok := hashesMap[value]; !ok {
 			hashesMap[value] = make([]int, 0)
 		}
@@ -51,6 +53,10 @@ func constructHashesMap(hashes[]DataBlockHash) map[uint64][]int {
 	}
 
 	return hashesMap
+}
+
+func (t *SourceTransmitter) updateDeadline() error {
+	return t.dataChannel.SetDeadline(time.Now().Add(t.SourceTransmitterOptions.Timeout))
 }
 
 // calculateMD5Hash function calculates md5 hash of a block [offset: offset + N]
@@ -67,15 +73,15 @@ func (t *SourceTransmitter) checkAndAppendDiff(
 
 	var foundHashIndexes []int = nil
 	var ok bool
-	if foundHashIndexes, ok = hashesMap[hash.value]; !ok {
+	if foundHashIndexes, ok = hashesMap[hash.Value]; !ok {
 		return false, -1
 	}
 
 	md5Hash := t.calculateMD5Hash(offset)
 	for _, hashIndex := range foundHashIndexes {
 		destHash := hashes[hashIndex]
-		if bytes.Compare(md5Hash, destHash.md5Hash) == 0 {
-			return true, destHash.offset
+		if bytes.Compare(md5Hash, destHash.Md5Hash) == 0 {
+			return true, destHash.Offset
 		}
 	}
 
@@ -104,7 +110,7 @@ func (t *SourceTransmitter) SendData(offset, size int) error {
 
 // TODO: document it
 func buildPolynomialHash(data string, options PolynomialHashOptions) PolynomialHash {
-	hash := PolynomialHash{value: 0}
+	hash := PolynomialHash{Value: 0}
 	index := 0
 	for ; index != len(data); index++ {
 		hash = hash.Append(int32(data[index]), options)
@@ -220,7 +226,7 @@ func (t *SourceTransmitter) PushMatchDiff(encoder *gob.Encoder, diff MatchDiff) 
 }
 
 func (t *SourceTransmitter) PushDataDiff(encoder *gob.Encoder, diff DataDiff) error {
-	controlByte := DATA
+	controlByte := byte(DATA)
 	if err := encoder.Encode(controlByte); err != nil {
 		return err
 	}
@@ -229,13 +235,43 @@ func (t *SourceTransmitter) PushDataDiff(encoder *gob.Encoder, diff DataDiff) er
 		return err
 	}
 
-	return  encoder.Encode(t.Data[diff.Offset:diff.Size])
+	return  encoder.Encode([]byte(t.Data[diff.Offset:diff.Size]))
+}
+
+func (t *SourceTransmitter) SendSyncCommand() error {
+	buf := []byte("sync ")
+	buf = append(buf, t.filename...)
+	buf = append(buf, '\n')
+
+	written := 0
+	for written < len(buf) {
+		if err := t.dataChannel.SetWriteDeadline(time.Now().Add(t.Timeout)); err != nil {
+			return err
+		}
+
+		n, err := t.dataChannel.Write(buf[written:])
+		written += n
+		if err != nil {
+			return err
+		}
+	}
+
+	log.Printf("client: sent command: %s", string(buf))
+	return nil
 }
 
 func (t *SourceTransmitter) PerformTransmission(ctx context.Context) error {
+	if err := t.SendSyncCommand(); err != nil {
+		return err
+	}
+
+	if err := t.dataChannel.SetReadDeadline(time.Now().Add(t.Timeout)); err != nil {
+		return err
+	}
+
 	hashes, err := t.ReceiveHashes(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to receive hashes: %w", err)
 	}
 
 	diffsSize := 1024
@@ -247,6 +283,7 @@ func (t *SourceTransmitter) PerformTransmission(ctx context.Context) error {
 
 	newCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	log.Print("client: try to transmit diffs")
 	go t.GenerateDiffs(newCtx, hashes, diffsChannel, quit)
 	return t.TransmitGeneratedDiffs(ctx, diffsChannel, quit)
 }
@@ -256,6 +293,7 @@ func (t *SourceTransmitter) TransmitGeneratedDiffs(
 	diffsChannel chan interface{},
 	quit chan error) error {
 
+	log.Print("client: start transmitting diffs")
 	encoder := gob.NewEncoder(t.dataChannel)
 
 loop:
@@ -266,11 +304,13 @@ loop:
 				break loop
 			}
 
-			if matchDiff, ok := diff.(MatchDiff); ok {
+			if matchDiff, ok1 := diff.(MatchDiff); ok1 {
+				log.Printf("client: got match diff. %v", matchDiff)
 				if err := t.PushMatchDiff(encoder, matchDiff); err != nil {
 					return err
 				}
-			} else if dataDiff, ok := diff.(DataDiff); ok {
+			} else if dataDiff, ok2 := diff.(DataDiff); ok2 {
+				log.Printf("client: got data diff. %v", dataDiff)
 				if err := t.PushDataDiff(encoder, dataDiff); err != nil {
 					return err
 				}
@@ -285,18 +325,21 @@ loop:
 		}
 	}
 
-	if err := encoder.Encode(END); err != nil {
+	log.Print("client: send ending message")
+	if err := encoder.Encode(byte(END)); err != nil {
 		return err
 	}
 
+	log.Print("client: finish transmitting diffs")
 	<- quit
 	return nil
 }
 
 func (t *SourceTransmitter) ReceiveHashes(ctx context.Context) ([]DataBlockHash, error) {
-	hashes := make([]DataBlockHash, 1)
+	hashes := make([]DataBlockHash, 0)
 	decoder := gob.NewDecoder(t.dataChannel)
 
+	log.Print("client: try to receive hashes")
 	for {
 		select {
 		case <- ctx.Done():
@@ -304,17 +347,24 @@ func (t *SourceTransmitter) ReceiveHashes(ctx context.Context) ([]DataBlockHash,
 		default:
 		}
 
-		var controlByte byte
-		if err := decoder.Decode(&controlByte); err != nil {
+		if err := t.updateDeadline(); err != nil {
 			return nil, err
 		}
 
+		var controlByte byte
+		if err := decoder.Decode(&controlByte); err != nil {
+			return nil, fmt.Errorf("failed to receive and decode control byte: %w", err)
+		}
+
+		log.Printf("client: got control byte: %b", controlByte)
+
 		if controlByte == END {
+			log.Print("client: end control byte received")
 			break
 		}
 
 		if controlByte != BLOCK {
-			return nil, errors.New(fmt.Sprintf("unknown control byte is received: %b", controlByte))
+			return nil, fmt.Errorf("unknown control byte is received: %b", controlByte)
 		}
 
 		numberHashes := 0
@@ -322,15 +372,18 @@ func (t *SourceTransmitter) ReceiveHashes(ctx context.Context) ([]DataBlockHash,
 			return nil ,err
 		}
 
+		log.Printf("client: got numberHashes: %d", numberHashes)
 		for i := 0; i != numberHashes; i++ {
 			var hash DataBlockHash
 			if err := decoder.Decode(&hash); err != nil {
-				return nil, err
+				return nil, fmt.Errorf("failed to decode %d-th hash: %w", i, err)
 			}
 
+			log.Printf("client: got DataBlockHash: %v", hash)
 			hashes = append(hashes, hash)
 		}
 	}
 
+	log.Printf("client: hashes were received. size: %d", len(hashes))
 	return hashes, nil
 }

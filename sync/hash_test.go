@@ -33,7 +33,7 @@ func TestPolynomialHash(t *testing.T) {
 	SIZE := 100000
 
 	options := CreatePolynomialHashOptions(a, mod, windowLength)
-	hash := PolynomialHash{value: 0}
+	hash := PolynomialHash{Value: 0}
 	data := generateData(SIZE)
 
 	windowStart := 0
@@ -41,9 +41,9 @@ func TestPolynomialHash(t *testing.T) {
 	for ; i != windowLength; i++ {
 		hash = hash.Append(int32(data[i]), options)
 		correctValue := calculatePolynomialHashByLoop(data, windowStart, i+1, options)
-		if hash.value != correctValue {
+		if hash.Value != correctValue {
 			t.Fatalf("Failed with indexes: [%d, %d), hash value: %d, correct hash value: %d",
-				windowStart, i+1, hash.value, correctValue)
+				windowStart, i+1, hash.Value, correctValue)
 		}
 	}
 
@@ -52,9 +52,9 @@ func TestPolynomialHash(t *testing.T) {
 		windowStart++
 		hash = hash.Append(int32(data[i]), options)
 		correctValue := calculatePolynomialHashByLoop(data, windowStart, i+1, options)
-		if hash.value != correctValue {
+		if hash.Value != correctValue {
 			t.Fatalf("Failed with indexes: [%d, %d), hash value: %d, correct hash value: %d",
-				windowStart, i+1, hash.value, correctValue)
+				windowStart, i+1, hash.Value, correctValue)
 		}
 	}
 }

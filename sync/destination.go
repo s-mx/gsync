@@ -3,12 +3,12 @@ package sync
 import (
 	"context"
 	"crypto/md5"
-	"encoding/binary"
 	"encoding/gob"
 	"errors"
 	"fmt"
-	"io"
 	"log"
+	"net"
+	"time"
 )
 
 type DestinationDataDiff struct {
@@ -20,22 +20,24 @@ type DestinationDataDiff struct {
 type DestinationTransmitterOptions struct {
 	hashOptions		PolynomialHashOptions
 
-	N		int
+	N       		int
+	Timeout			time.Duration
 }
 
 type DestinationTransmitter struct {
+	filename string
 	data	string
 	newData []byte
 
-	options		DestinationTransmitterOptions
-	dataChannel		io.ReadWriteCloser
+	options DestinationTransmitterOptions
+	conn    net.Conn
 }
 
 func CreateDestinationTransmitter(
-	data string,
+	filename, data string,
 	options DestinationTransmitterOptions,
-	channel io.ReadWriteCloser) *DestinationTransmitter {
-	return &DestinationTransmitter{data, nil, options, channel}
+	conn net.Conn) *DestinationTransmitter {
+	return &DestinationTransmitter{filename, data, nil, options, conn}
 }
 
 const (
@@ -46,33 +48,55 @@ const (
 	MATCHES = 0x5
 )
 
-// PerformTransmission() function performs a whole transmission process via protocol.
+func (t *DestinationTransmitter) updateDeadline() error {
+	return t.conn.SetDeadline(time.Now().Add(t.options.Timeout))
+}
+
+// PerformTransmission function performs a whole transmission process via protocol.
 // TODO: describe the protocol
-func (t *DestinationTransmitter) PerformTransmission(ctx context.Context) (string, error) {
+func (t *DestinationTransmitter) PerformTransmission(ctx context.Context) error {
+	command, err := ParseCommand(t.conn)
+	if err != nil {
+		err = fmt.Errorf("failed to parse: %w", err)
+		log.Print(err)
+		return err
+	}
+
+	if command.filename != t.filename {
+		err = errors.New(fmt.Sprintf("unknown filename: %s", t.filename))
+		log.Printf("%v", err.Error())
+		return err
+	}
+
 	channelSize := 4096 * 256 // TODO: setup this setting.
 	blockHashesChannel := make(chan DataBlockHash, channelSize)
 	quitChannel := make(chan error, 1)
 	newCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	go t.GenerateBlockHashes(newCtx, blockHashesChannel, quitChannel)
+	go t.generateBlockHashes(newCtx, blockHashesChannel, quitChannel)
 
-	var err error = nil
 	currentBufferSize := 0
 	bufferLimit := 1000
 	bufferHashes := make([]DataBlockHash, bufferLimit)
 
+	log.Print("server: start destination main loop")
 loop:
 	for {
 		var blockHash DataBlockHash
+		var ok bool
 		select {
 		case <-ctx.Done():
 			break
 
-		case blockHash = <-blockHashesChannel:
+		case blockHash, ok = <-blockHashesChannel:
+			if !ok {
+				continue
+			}
+
 			break
 
 		case err = <- quitChannel:
-			log.Printf("Received quit message from BuildBlockHash")
+			log.Printf("server: received quit message from BuildBlockHash")
 			break loop
 		}
 
@@ -88,26 +112,29 @@ loop:
 	}
 
 	if err == nil && currentBufferSize != 0 {
-		err = t.SendBlocksHashes(newCtx, bufferHashes[:currentBufferSize])
+		if err = t.SendBlocksHashes(newCtx, bufferHashes[:currentBufferSize]); err != nil {
+			return fmt.Errorf("server: failed to send block hashes: %w", err)
+		}
+
 		currentBufferSize = 0
 	}
 
-	if err != nil {
-		err = t.SendEndingMessage()
+	log.Print("server: end destination main loop")
+	if err = t.sendEndingMessage(); err != nil {
+		return fmt.Errorf("failed to perform transmission: %w", err)
 	}
 
-	var data string
-	if data, err = t.ConstructFile(ctx); err != nil {
-		return "", err
+	if err = t.ConstructFile(ctx); err != nil {
+		return err
 	}
 
-	return data, err
+	return err
 }
 
 type DataBlockHash struct {
-	offset		int
-	hash1		PolynomialHash
-	md5Hash		[]byte
+	Offset  int
+	Hash1   PolynomialHash
+	Md5Hash []byte
 }
 
 func (t *DestinationTransmitter) SendBlocksHashes(ctx context.Context, buffer []DataBlockHash) error {
@@ -115,60 +142,76 @@ func (t *DestinationTransmitter) SendBlocksHashes(ctx context.Context, buffer []
 		return nil
 	}
 
-	var err error = nil
-	if _, err = t.dataChannel.Write([]byte{BLOCK}); err != nil {
+	log.Printf("server: send block hashes. size: %d", len(buffer))
+	if err := t.updateDeadline(); err != nil {
 		return err
 	}
 
-	buf := make([]byte, 10)
-	count := binary.PutUvarint(buf, uint64(len(buffer)))
-	if _, err = t.dataChannel.Write(buf[:count]); err != nil {
+	encoder := gob.NewEncoder(t.conn)
+	if err := encoder.Encode(byte(BLOCK)); err != nil {
 		return err
 	}
 
-	encoder := gob.NewEncoder(t.dataChannel)
-	for _, hash := range buffer {
+	if err := encoder.Encode(len(buffer)); err != nil {
+		return err
+	}
+
+	for i := 0; i != len(buffer); i++ {
+		hash := buffer[i]
 		select {
 		case <- ctx.Done():
-			return nil
+			log.Print("server: end sending ")
+			return errors.New("end sending block hashes. context has closed")
 		default:
 		}
 
-		if err = encoder.Encode(hash); err != nil {
+		if err := t.updateDeadline(); err != nil {
 			return err
+		}
+
+		log.Printf("server: send %d-th hash: %v", i, hash)
+		if err := encoder.Encode(hash); err != nil {
+			return fmt.Errorf("server: failed to send hash: %w", err)
 		}
 	}
 
 	return nil
 }
 
-func (t *DestinationTransmitter) SendEndingMessage() error {
-	_, err := t.dataChannel.Write([]byte{END})
-	return err
+func (t *DestinationTransmitter) sendEndingMessage() error {
+	if err := t.updateDeadline(); err != nil {
+		return err
+	}
+
+	log.Print("server: send END")
+	encoder := gob.NewEncoder(t.conn)
+	b := byte(END)
+	return encoder.Encode(b)
 }
 
-func (t *DestinationTransmitter) GenerateBlockHashes(ctx context.Context, channel chan <- DataBlockHash, quit chan error) {
+func (t *DestinationTransmitter) generateBlockHashes(ctx context.Context, channel chan <- DataBlockHash, quit chan error) {
 	currentSize := 0
-	start := 0
 
 	hash1 := PolynomialHash{0}
 
 loop:
-	for i, ch := range t.data {
+	for start := 0; start + t.options.N < len(t.data); start++ {
+		ch := t.data[start]
 		select {
 		case <-ctx.Done():
 			break loop
 		default:
 		}
 
-		hash1 = hash1.Append(ch, t.options.hashOptions)
-		leftIndex := i - t.options.N
+		hash1 = hash1.Append(int32(ch), t.options.hashOptions)
+		leftIndex := start - t.options.N
 		if leftIndex >= 0 {
 			hash1 = hash1.PopLeft(int32(t.data[leftIndex]), t.options.hashOptions)
 		}
 
 		currentSize++
 		if currentSize == t.options.N {
+			log.Printf("GenerateBlockHashes: generate a hash for block [%d:%d]", start, start+currentSize)
 			md5Hash := md5.New()
 			md5Hash.Write([]byte(t.data[start : start+currentSize]))
 			md5HashValue := md5Hash.Sum(nil)
@@ -177,8 +220,8 @@ loop:
 		}
 	}
 
-	close(channel)
 	quit <- nil
+	close(channel)
 }
 
 func SpliceData(data *[]byte, start, end int, source []byte) {
@@ -305,7 +348,7 @@ func (t *DestinationTransmitter) ReadIncomingStream(
 	ctx context.Context,
 	diffsChannel chan <- interface{}) error {
 
-	decoder := gob.NewDecoder(t.dataChannel)
+	decoder := gob.NewDecoder(t.conn)
 
 	loop:
 	for {
@@ -344,7 +387,7 @@ func (t *DestinationTransmitter) ReadIncomingStream(
 	return nil
 }
 
-func (t* DestinationTransmitter) ConstructFile(ctx context.Context) (string, error) {
+func (t* DestinationTransmitter) ConstructFile(ctx context.Context) error {
 	quit := make(chan error, 1)
 
 	// TODO: it is better to justify to size of gotten data.
@@ -353,10 +396,10 @@ func (t* DestinationTransmitter) ConstructFile(ctx context.Context) (string, err
 	go t.WriteData(ctx, diffsChannel, quit)
 
 	if err := t.ReadIncomingStream(ctx, diffsChannel); err != nil {
-		return "", err
+		return err
 	}
 
 	close(diffsChannel)
 	<- quit
-	return string(t.newData), nil
+	return nil
 }
